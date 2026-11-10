@@ -1,4 +1,4 @@
--- Raise A Catboy OC | v1.11 surface walking | place 129852792970565, v632.
+-- Raise A Catboy OC | v1.13 surface walking | place 129852792970565, v632.
 -- Surface travel uses Roblox pathfinding and Humanoid:MoveTo.
 -- No UI. Edit Settings below. Re-running replaces the previous OC instance.
 -- Stop: getgenv().CatboyOC.Stop()
@@ -14,6 +14,7 @@ if env.Settings == nil then
         TRAIN_FOR_BETTER_EGGS = true,
         RESPECT_ZONE_SPEED = true,
         EGG_PRIORITY = "RARITY", -- RARITY or NEAREST.
+        UPGRADE_EGG_RESERVE = 2, -- extra bag slots for eggs better than the weakest queued rarity
         MAX_EGGS_IN_QUEUE = 10, -- includes both carried-in inventory and growing eggs.
         AUTO_PLACE_EGGS = true,
         AUTO_HATCH = true,
@@ -75,7 +76,7 @@ local Remotes = RS:WaitForChild("Remotes", 20)
 assert(Remotes, "Remotes have not loaded")
 
 local State: any = {
-    Version = "1.11-hatch-windows", Running = true, Status = "Starting", Errors = 0,
+    Version = "1.13-pickup-and-wheel", Running = true, Status = "Starting", Errors = 0,
     Banked = 0, Lost = 0, Hatched = 0, Requests = 0,
     LastError = nil, LastNotice = nil, Settings = Settings,
     StartedAt = os.clock(), Mode = "IDLE", Capabilities = {},
@@ -112,7 +113,7 @@ local defaults: any = {
     AUTO_CLAIM_INDEX=true, TELEPORT_TO_CAFE=false,
     DISABLE_GAMEPLAY_PAUSED=true, ANTI_AFK=true, MONEY_RESERVE=0,
     WHEEL_SECONDS=30, FARM_SECONDS_BETWEEN_WHEEL=90, TICK_INTERVAL=0.25,
-    SKIP_OUTGROWN_EGGS=true, TRAIN_FOR_BETTER_EGGS=true, NOCLIP=true, STOP_ON_REJECT_COUNT=false, DEBUG=false, DEBUG_INTERVAL=15,
+    UPGRADE_EGG_RESERVE=2, SKIP_OUTGROWN_EGGS=true, TRAIN_FOR_BETTER_EGGS=true, NOCLIP=true, STOP_ON_REJECT_COUNT=false, DEBUG=false, DEBUG_INTERVAL=15,
 }
 for key, value in pairs(defaults) do
     if Settings[key] == nil then Settings[key] = value end
@@ -182,7 +183,17 @@ local function allowed(filter: any, value: any, label: any): boolean
     end
     return false
 end
+local brake: any = nil
+local function releaseBrake()
+    if brake then
+        if brake.h.Parent and math.abs(brake.h.WalkSpeed-brake.applied)<0.1 then
+            brake.h.WalkSpeed=brake.original
+        end
+        brake=nil
+    end
+end
 local function stopMoving()
+    releaseBrake()
     local r, h = character()
     if r and h then h:MoveTo(r.Position) end
     move = nil
@@ -233,6 +244,21 @@ local function steer()
     if not move or not State.Running or not Settings.ENABLED then return end
     local r,h=character()
     if not r or not h then return end
+    if State.Mode=="WHEEL" and cycle and cycle.part.Parent then
+        local delta=r.Position-cycle.part.Position
+        local distance=Vector2.new(delta.X,delta.Z).Magnitude
+        if (attr("OnTreadmill",false) and distance<5) or (distance<1.1 and math.abs(delta.Y)<6) then
+            stopMoving()
+            h:Move(Vector3.zero)
+            return
+        end
+        if distance<math.max(28,h.WalkSpeed*0.35) or brake then
+            if not brake then brake={h=h,original=h.WalkSpeed,applied=h.WalkSpeed} end
+            if math.abs(h.WalkSpeed-brake.applied)>0.1 then brake.original=h.WalkSpeed end
+            brake.applied=math.min(brake.original,math.clamp(distance*1.4,5,60))
+            h.WalkSpeed=brake.applied
+        end
+    elseif brake then releaseBrake() end
     local route=move.route
     local point=route and route[move.index]
     local lead=math.clamp(h.WalkSpeed*0.065,2,8)
@@ -252,6 +278,7 @@ local function steer()
 end
 table.insert(connections,RunService.Heartbeat:Connect(steer))
 local function go(target: Vector3)
+    releaseBrake()
     local r, h = character()
     if not r or not h then return end
     local route = nil
@@ -274,7 +301,7 @@ local function movementStep(): string
     if not r or not h then return "wait" end
     local now = os.clock()
     local delta = r.Position - move.target
-    if Vector2.new(delta.X, delta.Z).Magnitude < 4 and math.abs(delta.Y) < 9 then
+    if Vector2.new(delta.X, delta.Z).Magnitude < (if State.Mode=="WHEEL" then 1.1 else 4) and math.abs(delta.Y) < 9 then
         stopMoving()
         return "done"
     end
@@ -516,7 +543,7 @@ for rarity,rows in pairs(Catboys.ByRarity) do
 end
 local function chooseEgg(now: number): any
     if now < nextScan then return candidate end
-    nextScan = now + 1
+    nextScan = now + 0.4
     candidate = nil
     lockedCandidate = nil
     local threshold=cafeThreshold()
@@ -751,23 +778,24 @@ local function tick(now: number)
     refreshPhase()
     local opening = lastPhase=="Reopening" or now<reopenUntil
     if opening and State.Mode=="PLACE_HOME" then stopMoving(); State.Mode="IDLE" end
-    if lastPhase=="Night" and State.Mode~="HOME_REQUEST" and Settings.AUTO_HATCH and hatchWindow(now) and readyEgg() then
-        if hatch(now) then status("Hatching during night"); return end
-    end
-    if State.Mode=="PLACE_HOME" then
-        local result=movementStep()
-        if result=="done" or result=="failed" then State.Mode="IDLE" end
-        return
-    end
-    if not opening and State.Mode~="HOME_REQUEST" and State.Mode~="EGG" and fillIncubators(now,true) then return end
     if State.Mode~="HOME_REQUEST" and Settings.AUTO_STEAL_EGGS and
-        (opening or (not Reveal:IsRevealing() and now>=(State.HatchUntil or 0))) and
-        eggCount()<number("MAX_EGGS_IN_QUEUE",10,1,100) and #items()<attr("BagLimit",100) then
+        #items()<attr("BagLimit",100) then
         local chosen=chooseEgg(now)
+        local count=eggCount()
+        local limit=number("MAX_EGGS_IN_QUEUE",10,1,100)
+        if count>=limit then
+            local weakest=math.huge
+            for _,item in pairs(items()) do
+                if item.kind=="Egg" then
+                    local rarity=RarityConfig.ByKey[item.rarity]
+                    weakest=math.min(weakest,rarity and rarity.Rank or 0)
+                end
+            end
+            if not chosen or chosen.rank<=weakest or count>=limit+number("UPGRADE_EGG_RESERVE",2,0,10) then chosen=nil end
+        end
         local canTrain=Settings.TRAIN_FOR_BETTER_EGGS and Settings.AUTO_GO_ON_WHEEL and attr("TreadmillTier",0)>0
-        local train=canTrain and lockedCandidate and lockedCandidate.egg.Parent and
-            (not chosen or lockedCandidate.rank>chosen.rank)
-        if opening and chosen then train=false end
+        local train=count<limit and canTrain and lockedCandidate and lockedCandidate.egg.Parent and
+            not chosen
         if not opening and train and State.Mode~="EGG" and fillIncubators(now,false) then return end
         if train then
             State.TrainingTarget=lockedCandidate.speed
@@ -792,6 +820,16 @@ local function tick(now: number)
         end
     else
         State.TrainingTarget=nil
+    end
+    if State.Mode=="PLACE_HOME" then
+        local result=movementStep()
+        if result=="done" or result=="failed" then State.Mode="IDLE" end
+        return
+    end
+
+    if not opening and State.Mode~="HOME_REQUEST" and State.Mode~="EGG" and fillIncubators(now,true) then return end
+    if lastPhase=="Night" and State.Mode~="HOME_REQUEST" and State.Mode~="EGG" and Settings.AUTO_HATCH and hatchWindow(now) and readyEgg() then
+        if hatch(now) then status("Hatching during night"); return end
     end
     if State.Mode == "HOME" or State.Mode == "HOME_REQUEST" then
         local result = movementStep()
@@ -833,7 +871,7 @@ local function tick(now: number)
         local result = movementStep()
         if result == "failed" then State.Mode = "IDLE"; lastWheel = now; return end
         if result == "done" and not attr("OnTreadmill", false) and now > (cycle.retryAt or 0) then
-            cycle.retryAt = now + 3
+            cycle.retryAt = now + 0.5
             go(cycle.part.Position + Vector3.new(0, cycle.part.Size.Y/2+3, 0))
         end
         if hatchWindow(now) and readyEgg() and hatch(now) then status("Training and hatching"); return end
