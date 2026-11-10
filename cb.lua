@@ -1,4 +1,4 @@
--- Raise A Catboy OC | v1.8 surface walking | place 129852792970565, v632.
+-- Raise A Catboy OC | v1.11 surface walking | place 129852792970565, v632.
 -- Surface travel uses Roblox pathfinding and Humanoid:MoveTo.
 -- No UI. Edit Settings below. Re-running replaces the previous OC instance.
 -- Stop: getgenv().CatboyOC.Stop()
@@ -10,6 +10,8 @@ if env.Settings == nil then
         AUTO_STEAL_EGGS = true,
         RARITY_FILTER = {"ALL"}, -- e.g. {"Rare", "Epic"}; empty means none.
         ZONE_FILTER = {"ALL"}, -- zone numbers or names, e.g. {1, 2, "Arcade Alley"}.
+        SKIP_OUTGROWN_EGGS = true, -- once every cafe slot is occupied
+        TRAIN_FOR_BETTER_EGGS = true,
         RESPECT_ZONE_SPEED = true,
         EGG_PRIORITY = "RARITY", -- RARITY or NEAREST.
         MAX_EGGS_IN_QUEUE = 10, -- includes both carried-in inventory and growing eggs.
@@ -63,6 +65,7 @@ end
 local Snapshot = module(Controllers, "SnapshotController")
 local Reveal = module(Controllers, "HatchRevealController")
 local Placement = module(Util, "Placement")
+local Catboys = module(Config, "CatboyConfig")
 local SpeedConfig = module(Config, "SpeedConfig")
 local ZoneConfig = module(Config, "ZoneConfig")
 local RarityConfig = module(Config, "RarityConfig")
@@ -72,7 +75,7 @@ local Remotes = RS:WaitForChild("Remotes", 20)
 assert(Remotes, "Remotes have not loaded")
 
 local State: any = {
-    Version = "1.8-surface", Running = true, Status = "Starting", Errors = 0,
+    Version = "1.11-hatch-windows", Running = true, Status = "Starting", Errors = 0,
     Banked = 0, Lost = 0, Hatched = 0, Requests = 0,
     LastError = nil, LastNotice = nil, Settings = Settings,
     StartedAt = os.clock(), Mode = "IDLE", Capabilities = {},
@@ -109,7 +112,7 @@ local defaults: any = {
     AUTO_CLAIM_INDEX=true, TELEPORT_TO_CAFE=false,
     DISABLE_GAMEPLAY_PAUSED=true, ANTI_AFK=true, MONEY_RESERVE=0,
     WHEEL_SECONDS=30, FARM_SECONDS_BETWEEN_WHEEL=90, TICK_INTERVAL=0.25,
-    NOCLIP=true, STOP_ON_REJECT_COUNT=false, DEBUG=false, DEBUG_INTERVAL=15,
+    SKIP_OUTGROWN_EGGS=true, TRAIN_FOR_BETTER_EGGS=true, NOCLIP=true, STOP_ON_REJECT_COUNT=false, DEBUG=false, DEBUG_INTERVAL=15,
 }
 for key, value in pairs(defaults) do
     if Settings[key] == nil then Settings[key] = value end
@@ -325,19 +328,23 @@ local function freePosition(): (number?, number?)
     end
     return Placement.FindFree(area, 0, 0, Placement.EggRadius(), occupied, nil, 40, 2)
 end
-local function placeEgg(now: number): boolean
+local function fillIncubators(now: number, nearOnly: boolean): boolean
     if not Settings.AUTO_PLACE_EGGS then return false end
     local growing = 0
     local waiting = {}
     for _, item in pairs(items()) do
         if item.kind == "Egg" then
             if item.placed == "floor" then growing += 1
-            elseif item.placed == "" and now >= (pending["place:" .. item.id] or 0) then
+            elseif item.placed == "" then
                 table.insert(waiting, item)
             end
         end
     end
+    State.BagEggs, State.PlacedEggs = #waiting, growing
     if growing >= attr("EggCap", 10) or #waiting == 0 then return false end
+    for _,item in ipairs(waiting) do
+        if now < (pending["place:" .. item.id] or 0) then return true end
+    end
     table.sort(waiting, function(a, b)
         local ra, rb = RarityConfig.ByKey[a.rarity], RarityConfig.ByKey[b.rarity]
         return (ra and ra.Rank or 0) > (rb and rb.Rank or 0)
@@ -345,7 +352,14 @@ local function placeEgg(now: number): boolean
     local target = homeTarget()
     local r = character()
     if not r or not target then return false end
-    if (r.Position - target).Magnitude > 20 then goHome("HOME"); return true end
+    if (r.Position - target).Magnitude > 20 then
+        if nearOnly then return false end
+        goHome("PLACE_HOME")
+        status("Returning to place eggs")
+        return true
+    end
+    stopMoving()
+    State.Mode = "IDLE"
     local x, z = freePosition()
     if not x then status("No free café floor space"); return false end
     local item = waiting[1]
@@ -364,8 +378,35 @@ local function readyEgg(): boolean
     end
     return false
 end
+local gameState = RS:WaitForChild("GameState", 15)
+local reopenUntil = 0
+local lastPhase: any = nil
+local function refreshPhase()
+    if not gameState then return end
+    local phase = gameState:GetAttribute("Phase")
+    if phase ~= lastPhase then
+        if phase == "Reopening" or (phase == "Day" and (lastPhase == "Night" or lastPhase == "Reopening")) then
+            reopenUntil = os.clock() + 8
+            nextScan = 0
+            candidate = nil
+        end
+        lastPhase = phase
+        State.Phase = phase
+    end
+end
+if gameState then
+    refreshPhase()
+    table.insert(connections, gameState:GetAttributeChangedSignal("Phase"):Connect(refreshPhase))
+end
+local function hatchWindow(now: number): boolean
+    refreshPhase()
+    if not gameState or lastPhase=="Reopening" or now<reopenUntil then return false end
+    local endsAt=tonumber(gameState:GetAttribute("PhaseEndsAt"))
+    if not endsAt or endsAt-workspace:GetServerTimeNow()<=5 then return false end
+    return lastPhase=="Night" or (lastPhase=="Day" and attr("OnTreadmill",false)==true)
+end
 local function hatch(now: number): boolean
-    if not Settings.AUTO_HATCH then return false end
+    if not Settings.AUTO_HATCH or not hatchWindow(now) or Reveal:IsRevealing() or now<(State.HatchUntil or 0) then return false end
     for _, v in ipairs(ownAnchors()) do
         if v:GetAttribute("ItemKind") == "Egg" and
             (v:GetAttribute("Ready") == true or v:GetAttribute("State") == "Ready") then
@@ -449,10 +490,37 @@ local function support(now: number)
         end
     end
 end
+local lockedCandidate: any = nil
+local function cafeThreshold(): number
+    if not Settings.SKIP_OUTGROWN_EGGS then return 0 end
+    local slots = 0
+    for _,level in ipairs(PlotConfig.Pen.Levels) do
+        if level.Level == attr("PenLevel",0) then slots=level.Pods; break end
+    end
+    local count, weakest = 0, math.huge
+    for _,item in pairs(items()) do
+        if item.kind=="Catboy" and item.placed=="floor" then
+            local row=Catboys.ById[item.catboyId]
+            if not row then return 0 end
+            count+=1
+            weakest=math.min(weakest,row.Income)
+        end
+    end
+    return if slots>0 and count>=slots then weakest else 0
+end
+local ceilings: any = {}
+for rarity,rows in pairs(Catboys.ByRarity) do
+    local maximum=0
+    for _,row in ipairs(rows) do maximum=math.max(maximum,row.Income or 0) end
+    ceilings[rarity]=maximum
+end
 local function chooseEgg(now: number): any
     if now < nextScan then return candidate end
     nextScan = now + 1
     candidate = nil
+    lockedCandidate = nil
+    local threshold=cafeThreshold()
+    State.MinUpgradeIncome=threshold
     local r = character()
     if not r then return nil end
     local bestScore = -math.huge
@@ -464,16 +532,21 @@ local function chooseEgg(now: number): any
             local row = ZoneConfig.Zones[zone]
             if row and allowed(Settings.ZONE_FILTER, zone, row.Name) and
                 allowed(Settings.RARITY_FILTER, rarity, nil) and
-                (not Settings.RESPECT_ZONE_SPEED or attr("Speed", 0) >= row.RequiredSpeed) then
+                (threshold==0 or egg:GetAttribute("IsSpecial")==true or (ceilings[rarity] or math.huge)>threshold) then
                 local prompt = egg:FindFirstChildWhichIsA("ProximityPrompt", true)
                 if prompt and prompt.Enabled and prompt.MaxActivationDistance > 0 then
                     local distance = (egg:GetPivot().Position - r.Position).Magnitude
                     local rankRow = RarityConfig.ByKey[rarity]
                     local rank = rankRow and rankRow.Rank or 0
                     local score = if Settings.EGG_PRIORITY == "NEAREST" then -distance else rank * 100000 - distance
-                    if score > bestScore then
+                    local option={egg=egg,prompt=prompt,rarity=rarity,zone=zone,rank=rank,speed=row.RequiredSpeed}
+                    if Settings.RESPECT_ZONE_SPEED and attr("Speed",0)<row.RequiredSpeed then
+                        if not lockedCandidate or rank>lockedCandidate.rank or (rank==lockedCandidate.rank and row.RequiredSpeed<lockedCandidate.speed) then
+                            lockedCandidate=option
+                        end
+                    elseif score > bestScore then
                         bestScore = score
-                        candidate = {egg=egg, prompt=prompt, rarity=rarity, zone=zone}
+                        candidate = option
                     end
                 end
             end
@@ -675,13 +748,58 @@ local function tick(now: number)
         status("Returning to café")
         return
     end
+    refreshPhase()
+    local opening = lastPhase=="Reopening" or now<reopenUntil
+    if opening and State.Mode=="PLACE_HOME" then stopMoving(); State.Mode="IDLE" end
+    if lastPhase=="Night" and State.Mode~="HOME_REQUEST" and Settings.AUTO_HATCH and hatchWindow(now) and readyEgg() then
+        if hatch(now) then status("Hatching during night"); return end
+    end
+    if State.Mode=="PLACE_HOME" then
+        local result=movementStep()
+        if result=="done" or result=="failed" then State.Mode="IDLE" end
+        return
+    end
+    if not opening and State.Mode~="HOME_REQUEST" and State.Mode~="EGG" and fillIncubators(now,true) then return end
+    if State.Mode~="HOME_REQUEST" and Settings.AUTO_STEAL_EGGS and
+        (opening or (not Reveal:IsRevealing() and now>=(State.HatchUntil or 0))) and
+        eggCount()<number("MAX_EGGS_IN_QUEUE",10,1,100) and #items()<attr("BagLimit",100) then
+        local chosen=chooseEgg(now)
+        local canTrain=Settings.TRAIN_FOR_BETTER_EGGS and Settings.AUTO_GO_ON_WHEEL and attr("TreadmillTier",0)>0
+        local train=canTrain and lockedCandidate and lockedCandidate.egg.Parent and
+            (not chosen or lockedCandidate.rank>chosen.rank)
+        if opening and chosen then train=false end
+        if not opening and train and State.Mode~="EGG" and fillIncubators(now,false) then return end
+        if train then
+            State.TrainingTarget=lockedCandidate.speed
+            State.TrainingZone=lockedCandidate.zone
+            if State.Mode~="WHEEL" and wheel(now) then return end
+            if State.Mode=="WHEEL" then
+                cycle.untilTime=now+5
+                chosen=nil
+            end
+        else
+            State.TrainingTarget=nil
+        end
+        if chosen and chosen.egg.Parent and (State.Mode~="EGG" or
+            not cycle or not cycle.egg.Parent or chosen.rank>(cycle.rank or 0)) then
+            stopMoving()
+            cycle={egg=chosen.egg,prompt=chosen.prompt,rank=chosen.rank,nextPrompt=now+0.7,deadline=now+90}
+            State.Mode="EGG"
+            local distance=math.clamp(chosen.prompt.MaxActivationDistance-2,2,8)
+            go(chosen.egg:GetPivot().Position+Vector3.new(-distance,1.5,0))
+            status("Collecting "..tostring(chosen.rarity).." in zone "..tostring(chosen.zone))
+            return
+        end
+    else
+        State.TrainingTarget=nil
+    end
     if State.Mode == "HOME" or State.Mode == "HOME_REQUEST" then
         local result = movementStep()
         if result ~= "moving" and result ~= "wait" then State.Mode = "IDLE" end
         return
     end
     if State.Mode == "EGG" then
-        if not cycle or not cycle.egg.Parent or not cycle.prompt.Parent then
+        if not cycle or not cycle.egg.Parent or not cycle.prompt.Parent or (cycle.egg:GetAttribute("CarriedBy") or 0)~=0 then
             stopMoving(); State.Mode = "IDLE"; return
         end
         if not Settings.AUTO_STEAL_EGGS then stopMoving(); State.Mode = "IDLE"; return end
@@ -707,6 +825,7 @@ local function tick(now: number)
         end
         return
     end
+    if not opening and State.Mode=="WHEEL" and fillIncubators(now,false) then return end
     if State.Mode == "WHEEL" then
         if not Settings.AUTO_GO_ON_WHEEL or not cycle or now >= cycle.untilTime then
             stopMoving(); State.Mode = "IDLE"; lastWheel = now; return
@@ -717,7 +836,8 @@ local function tick(now: number)
             cycle.retryAt = now + 3
             go(cycle.part.Position + Vector3.new(0, cycle.part.Size.Y/2+3, 0))
         end
-        status("Training on wheel")
+        if hatchWindow(now) and readyEgg() and hatch(now) then status("Training and hatching"); return end
+        status(if State.TrainingTarget then "Training for zone "..State.TrainingZone.." ("..State.TrainingTarget.." speed)" else "Training on wheel")
         return
     end
     if now < (State.HatchUntil or 0) or Reveal:IsRevealing() then
@@ -725,30 +845,8 @@ local function tick(now: number)
         status("Waiting for hatch reveal")
         return
     end
-    if Settings.AUTO_HATCH and readyEgg() then
-        local home = homeTarget()
-        if home and (r.Position-home).Magnitude > 25 then
-            goHome("HOME")
-            status("Returning to hatch eggs")
-            return
-        end
-        if hatch(now) then stopMoving(); status("Hatching ready egg"); return end
-    end
-    if placeEgg(now) then return end
+    if fillIncubators(now,false) then return end
     if now - lastWheel >= number("FARM_SECONDS_BETWEEN_WHEEL", 90, 5, 86400) and wheel(now) then return end
-    if Settings.AUTO_STEAL_EGGS and eggCount() < number("MAX_EGGS_IN_QUEUE", 10, 1, 100) and
-        #items() < attr("BagLimit", 100) then
-        local chosen = chooseEgg(now)
-        if chosen and chosen.egg.Parent then
-            cycle = {egg=chosen.egg, prompt=chosen.prompt, nextPrompt=now+0.7, deadline=now+90}
-            State.Mode = "EGG"
-            local eggPosition = chosen.egg:GetPivot().Position
-            local distance = math.max(2, math.min(8, chosen.prompt.MaxActivationDistance-2))
-            go(eggPosition + Vector3.new(-distance, 1.5, 0))
-            status("Collecting " .. tostring(chosen.rarity) .. " in zone " .. tostring(chosen.zone))
-            return
-        end
-    end
     if wheel(now) then return end
     status("Waiting for matching eggs or upgrades")
 end
