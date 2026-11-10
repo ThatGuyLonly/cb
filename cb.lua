@@ -1,4 +1,4 @@
--- Raise A Catboy OC | v1.13 surface walking | place 129852792970565, v632.
+-- Raise A Catboy OC | v1.14 surface walking | place 129852792970565, v632.
 -- Surface travel uses Roblox pathfinding and Humanoid:MoveTo.
 -- No UI. Edit Settings below. Re-running replaces the previous OC instance.
 -- Stop: getgenv().CatboyOC.Stop()
@@ -76,7 +76,7 @@ local Remotes = RS:WaitForChild("Remotes", 20)
 assert(Remotes, "Remotes have not loaded")
 
 local State: any = {
-    Version = "1.13-pickup-and-wheel", Running = true, Status = "Starting", Errors = 0,
+    Version = "1.14-lobby-recovery", Running = true, Status = "Starting", Errors = 0,
     Banked = 0, Lost = 0, Hatched = 0, Requests = 0,
     LastError = nil, LastNotice = nil, Settings = Settings,
     StartedAt = os.clock(), Mode = "IDLE", Capabilities = {},
@@ -93,6 +93,7 @@ local homeRequested = false
 local nextSupport = 0
 local nextDebug = 0
 local nextAfk = 0
+local lobbyRecovery: any = nil
 local nextScan = 0
 local candidate: any = nil
 local areaBase: Instance? = nil
@@ -214,7 +215,7 @@ local function releaseParts()
 end
 table.insert(connections,RunService.Stepped:Connect(function()
     local model=Player.Character
-    if not State.Running or not Settings.ENABLED or not Settings.NOCLIP or not model then
+    if not State.Running or not Settings.ENABLED or not Settings.NOCLIP or State.Mode=="REROLL_LOBBY" or not model then
         if trackedCharacter then releaseParts() end
         return
     end
@@ -661,10 +662,72 @@ table.insert(connections, Player.Idled:Connect(function()
         end)
     end
 end))
+-- Notify can send either a message table or positional text arguments.
+local function isLobbyReroll(...)
+    for i=1,select("#",...) do
+        local value=select(i,...)
+        local message=if type(value)=="table" then value.text else value
+        if type(message)=="string" then
+            local lower=string.lower(message)
+            if lower:find("nest",1,true) and lower:find("reroll",1,true) and lower:find("lobby",1,true) then return true end
+        end
+    end
+    return false
+end
+local function recoverAtLobby(now: number, root: BasePart, humanoid: Humanoid)
+    if not lobbyRecovery then return false end
+    local lobby=workspace:FindFirstChild("Lobby")
+    local floor=lobby and lobby:FindFirstChild("Floor")
+    if not floor or not floor:IsA("BasePart") then
+        stopMoving()
+        status("Waiting for lobby floor to load")
+        return true
+    end
+    if State.Mode~="REROLL_LOBBY" or not lobbyRecovery.target then
+        stopMoving()
+        cycle=nil
+        candidate=nil
+        lockedCandidate=nil
+        State.Mode="REROLL_LOBBY"
+        -- Head to a point well inside the lobby, on the walkable floor.
+        local localPos=floor.CFrame:PointToObjectSpace(root.Position)
+        local half=floor.Size/2
+        lobbyRecovery.target=floor.CFrame:PointToWorldSpace(Vector3.new(
+            math.clamp(localPos.X,-half.X*0.75,half.X*0.75),half.Y+3,
+            math.clamp(localPos.Z,-half.Z*0.75,half.Z*0.75)))
+        lobbyRecovery.settled=nil
+        lobbyRecovery.retry=now
+    end
+    local delta=root.Position-lobbyRecovery.target
+    local inside=Vector2.new(delta.X,delta.Z).Magnitude<=5 and math.abs(delta.Y)<5
+    local grounded=humanoid.FloorMaterial~=Enum.Material.Air
+    local zone=Player:GetAttribute("ZoneIndex")
+    if inside and grounded and (zone==nil or zone==0) then
+        if not lobbyRecovery.settled then stopMoving(); lobbyRecovery.settled=now end
+        if now-lobbyRecovery.settled>=1 then
+            lobbyRecovery=nil
+            nextScan=0
+            State.Mode="IDLE"
+            status("Lobby reached; scanning current nests")
+        end
+    else
+        lobbyRecovery.settled=nil
+        if move then movementStep()
+        elseif now>=lobbyRecovery.retry then
+            lobbyRecovery.retry=now+2
+            go(lobbyRecovery.target)
+        end
+    end
+    return true
+end
 local notify = Remotes:FindFirstChild("Notify")
 if notify and notify:IsA("RemoteEvent") then
     table.insert(connections, notify.OnClientEvent:Connect(function(...)
         State.LastNotice = {...}
+        if isLobbyReroll(...) and not lobbyRecovery then
+            lobbyRecovery={}
+            status("Nests rerolled; returning to lobby")
+        end
     end))
 end
 local teleportEvent = Remotes:FindFirstChild("TeleportTo")
@@ -769,6 +832,7 @@ local function tick(now: number)
         end
         return
     end
+    if recoverAtLobby(now,r,h) then return end
     if homeRequested then
         homeRequested = false
         goHome("HOME_REQUEST")
